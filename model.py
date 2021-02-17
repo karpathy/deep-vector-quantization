@@ -53,9 +53,10 @@ class VQVAEQuantize(nn.Module):
         _, ind = (-dist).max(1)
         ind = ind.view(B, H, W)
 
-        commitment_cost = 0.25
+        # vector quantization cost that trains the embedding vectors
         z_q = self.embed_code(ind) # (B, H, W, C)
-        diff = (z_q.detach() - z_e).pow(2).mean() + commitment_cost * (z_q - z_e.detach()).pow(2).mean()
+        commitment_cost = 0.25
+        diff = commitment_cost * (z_q.detach() - z_e).pow(2).mean() + (z_q - z_e.detach()).pow(2).mean()
 
         z_q = z_e + (z_q - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
         z_q = z_q.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
