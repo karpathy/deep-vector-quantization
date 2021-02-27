@@ -5,8 +5,8 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from data import CIFAR10Data
-from model import VQVAE
+from dvq.data.cifar10 import CIFAR10Data
+from dvq.model.vqvae import VQVAE
 
 def main():
     pl.seed_everything(1337)
