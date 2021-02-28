@@ -27,36 +27,27 @@ class VQVAE(pl.LightningModule):
     def __init__(
         self,
         args,
-        in_channel=3, # rgb
-        num_hiddens=128, # default deepmind settings
-        num_residual_hiddens=32,
-        embedding_dim=64,
-        num_embeddings=512,
+        input_channels=3,   # number of channels at the input (for images typically 3 = RGB)
+        n_hid=64,           # controls the size of the model
+        embedding_dim=32,   # the embedding size for each vocabulary element
+        num_embeddings=512, # size of the vocabulary at the middle
     ):
         super().__init__()
 
-        if args.enc_dec_flavor == 'deepmind':
-            self.encoder = DeepMindEncoder(in_channel, num_hiddens, num_residual_hiddens)
-            self.decoder = DeepMindDecoder(in_channel, num_hiddens, num_residual_hiddens, embedding_dim)
-            quantizer_input_channels = num_hiddens
-        elif args.enc_dec_flavor == 'openai':
-            # hacky, but openai modules have a different interpretation for where num_hiddens is measured (i.e. at base)
-            # we scale here so that we end up with roughly similar sizes of networks between the two flavors
-            num_hiddens = num_hiddens // 2
-            stride = 4
-            common = {'stride': stride, 'n_hid': num_hiddens, 'vocab_size': num_embeddings,
-                      'requires_grad': True, 'use_mixed_precision': False}
-            n_init = num_hiddens // 2
-            self.encoder = OpenAIEncoder(**common, input_channels=in_channel)
-            self.decoder = OpenAIDecoder(**common, output_channels=in_channel, n_init=n_init)
-            quantizer_input_channels = num_hiddens*2 if stride == 4 else num_hiddens*8
-            embedding_dim = n_init
+        # init encoder/decoder module pair
+        Encoder, Decoder = {
+            'deepmind': (DeepMindEncoder, DeepMindDecoder),
+            'openai': (OpenAIEncoder, OpenAIDecoder),
+        }[args.enc_dec_flavor]
+        self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid)
+        self.decoder = Decoder(n_init=embedding_dim, n_hid=n_hid, output_channels=input_channels)
 
+        # init the quantizer module
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[args.vq_flavor]
-        self.quantizer = QuantizerModule(quantizer_input_channels, embedding_dim, num_embeddings)
+        self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim)
 
     def forward(self, x):
         z = self.encoder(x)

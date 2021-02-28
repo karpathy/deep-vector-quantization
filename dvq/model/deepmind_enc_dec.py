@@ -10,13 +10,13 @@ import torch.nn.functional as F
 # -----------------------------------------------------------------------------
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channel, channel):
+    def __init__(self, input_channels, channel):
         super().__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channel, channel, 3, padding=1),
+            nn.Conv2d(input_channels, channel, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channel, in_channel, 1),
+            nn.Conv2d(channel, input_channels, 1),
         )
 
     def forward(self, x):
@@ -28,19 +28,22 @@ class ResBlock(nn.Module):
 
 class DeepMindEncoder(nn.Module):
 
-    def __init__(self, in_channel=3, num_hiddens=128, num_residual_hiddens=32):
+    def __init__(self, input_channels=3, n_hid=64):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Conv2d(in_channel, num_hiddens//2, 4, stride=2, padding=1),
+            nn.Conv2d(input_channels, n_hid, 4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(num_hiddens//2, num_hiddens, 4, stride=2, padding=1),
+            nn.Conv2d(n_hid, 2*n_hid, 4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(num_hiddens, num_hiddens, 3, padding=1),
+            nn.Conv2d(2*n_hid, 2*n_hid, 3, padding=1),
             nn.ReLU(),
-            ResBlock(num_hiddens, num_residual_hiddens),
-            ResBlock(num_hiddens, num_residual_hiddens),
+            ResBlock(2*n_hid, 2*n_hid//4),
+            ResBlock(2*n_hid, 2*n_hid//4),
         )
+
+        self.output_channels = 2 * n_hid
+        self.output_stide = 4
 
     def forward(self, x):
         return self.net(x)
@@ -48,17 +51,17 @@ class DeepMindEncoder(nn.Module):
 
 class DeepMindDecoder(nn.Module):
 
-    def __init__(self, in_channel=3, num_hiddens=128, num_residual_hiddens=32, embedding_dim=64):
+    def __init__(self, n_init=32, n_hid=64, output_channels=3):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Conv2d(embedding_dim, num_hiddens, 3, padding=1),
+            nn.Conv2d(n_init, 2*n_hid, 3, padding=1),
             nn.ReLU(),
-            ResBlock(num_hiddens, num_residual_hiddens),
-            ResBlock(num_hiddens, num_residual_hiddens),
-            nn.ConvTranspose2d(num_hiddens, num_hiddens//2, 4, stride=2, padding=1),
+            ResBlock(2*n_hid, 2*n_hid//4),
+            ResBlock(2*n_hid, 2*n_hid//4),
+            nn.ConvTranspose2d(2*n_hid, n_hid, 4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(num_hiddens//2, in_channel, 4, stride=2, padding=1),
+            nn.ConvTranspose2d(n_hid, output_channels, 4, stride=2, padding=1),
         )
 
     def forward(self, x):

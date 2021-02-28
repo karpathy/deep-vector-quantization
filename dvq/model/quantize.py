@@ -22,7 +22,7 @@ class VQVAEQuantize(nn.Module):
     https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
     https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
     """
-    def __init__(self, num_hiddens, embedding_dim, n_embed):
+    def __init__(self, num_hiddens, n_embed, embedding_dim):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -77,7 +77,7 @@ class GumbelQuantize(nn.Module):
     Categorical Reparameterization with Gumbel-Softmax, Jang et al. 2016
     https://arxiv.org/abs/1611.01144
     """
-    def __init__(self, num_hiddens, embedding_dim, n_embed, straight_through=False):
+    def __init__(self, num_hiddens, n_embed, embedding_dim, straight_through=False):
         super().__init__()
 
         self.embedding_dim = embedding_dim
