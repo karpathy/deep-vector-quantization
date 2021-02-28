@@ -4,6 +4,7 @@ encoder, decoder and a quantize layer in the middle for the discrete bottleneck.
 """
 
 import os
+import math
 from argparse import ArgumentParser
 
 import torch
@@ -110,7 +111,8 @@ class VQVAE(pl.LightningModule):
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": 1e-5},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=3e-4, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(optim_groups, lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-5)
+        self.optimizer = optimizer
 
         return optimizer
 
@@ -141,19 +143,40 @@ def cli_main():
     data = CIFAR10Data(args)
     model = VQVAE(args)
 
+    # annealing schedules for lots of constants
     checkpoint_callback = ModelCheckpoint(monitor='val_recon_error', mode='min')
 
+    def cos_anneal(e0, e1, t0, t1, e):
+        """ ramp from (e0, t0) -> (e1, t1) through a cosine schedule based on e \in [e0, e1] """
+        alpha = max(0, min(1, (e - e0) / (e1 - e0))) # what fraction of the way through are we
+        alpha = 1.0 - math.cos(alpha * math.pi/2) # warp through cosine
+        t = alpha * t1 + (1 - alpha) * t0 # interpolate accordingly
+        return t
+
+    # these follow the OpenAI DALL-E paper recommendations *very roughly*
     class DecayTemperature(pl.Callback):
         def on_train_epoch_start(self, trainer, pl_module):
-            e = trainer.current_epoch
-            e0,e1 = 0, 30
-            t0,t1 = 1.0, 0.1
-            alpha = max(0, min(1, (e - e0) / (e1 - e0)))
-            t = alpha * t1 + (1 - alpha) * t0 # probably should be exponential instead
-            print("epoch %d setting temperature of model's quantizer to %f" % (e, t))
+            t = cos_anneal(0, 50, 1.0, 1.0/16, trainer.current_epoch)
+            print("epoch %d: setting temperature of model's quantizer to %f" % (trainer.current_epoch, t))
             pl_module.quantizer.temperature = t
 
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback, DecayTemperature()])
+    class RampBeta(pl.Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            t = cos_anneal(0, 20, 0.0, 5e-4, trainer.current_epoch)
+            print("epoch %d: setting kld scale to %e" % (trainer.current_epoch, t))
+            pl_module.quantizer.kld_scale = t
+
+    class DecayLR(pl.Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            t = cos_anneal(0, 100, 3e-4, 1e-5, trainer.current_epoch)
+            print("epoch %d: setting learning rate to %e" % (trainer.current_epoch, t))
+            for g in pl_module.optimizer.param_groups:
+                g['lr'] = t
+
+    callbacks = [checkpoint_callback, DecayLR()]
+    if args.vq_flavor == 'gumbel':
+        callbacks.extend([DecayTemperature(), RampBeta()])
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_epochs=200)
 
     trainer.fit(model, data)
 

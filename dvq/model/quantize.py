@@ -77,7 +77,7 @@ class GumbelQuantize(nn.Module):
     Categorical Reparameterization with Gumbel-Softmax, Jang et al. 2016
     https://arxiv.org/abs/1611.01144
     """
-    def __init__(self, num_hiddens, embedding_dim, n_embed, straight_through=True):
+    def __init__(self, num_hiddens, embedding_dim, n_embed, straight_through=False):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -85,6 +85,7 @@ class GumbelQuantize(nn.Module):
 
         self.straight_through = straight_through
         self.temperature = 1.0
+        self.kld_scale = 5e-4
 
         self.proj = nn.Conv2d(num_hiddens, n_embed, 1)
         self.embed = nn.Embedding(n_embed, embedding_dim)
@@ -99,9 +100,8 @@ class GumbelQuantize(nn.Module):
         z_q = einsum('b n h w, n d -> b d h w', soft_one_hot, self.embed.weight)
 
         # + kl divergence to the prior loss
-        kld_scale = 5e-4 # lol. partly because we are lazily using unnormalized mse loss for reconstruction term
         qy = F.softmax(logits, dim=1)
-        diff = kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
+        diff = self.kld_scale * torch.sum(qy * torch.log(qy * self.n_embed + 1e-10), dim=1).mean()
 
         ind = soft_one_hot.argmax(dim=1)
         return z_q, diff, ind
