@@ -114,19 +114,29 @@ class VQVAE(pl.LightningModule):
 
         return optimizer
 
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        parser = ArgumentParser(parents=[parent_parser], add_help=False)
+        parser.add_argument("--vq_flavor", type=str, default='vqvae', choices=['vqvae', 'gumbel'])
+        return parser
 
 def cli_main():
     pl.seed_everything(1337)
 
+    # -------------------------------------------------------------------------
+    # arguments...
     parser = ArgumentParser()
+    # training related
+    parser = pl.Trainer.add_argparse_args(parser)
     # model related
-    parser.add_argument("--vq_flavor", type=str, default='vqvae', choices=['vqvae', 'gumbel'])
-    # data related
+    parser = VQVAE.add_model_specific_args(parser)
+    # dataloader related
     parser.add_argument("--data_dir", type=str, default='/apcv/users/akarpathy/cifar10')
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser = pl.Trainer.add_argparse_args(parser)
+    # done!
     args = parser.parse_args()
+    # -------------------------------------------------------------------------
 
     data = CIFAR10Data(args)
     model = VQVAE(args)
