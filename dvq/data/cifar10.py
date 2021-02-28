@@ -5,14 +5,11 @@ from torchvision.datasets import CIFAR10
 import pytorch_lightning as pl
 
 class CIFAR10Data(pl.LightningDataModule):
+    """ returns cifar-10 examples in floats in range [0,1] """
 
     def __init__(self, args):
         super().__init__()
         self.hparams = args
-
-        # these will put numbers into range [-0.5, 0.5], as used by DeepMind in their sonnet VQVAE example
-        self.mean = (0.5, 0.5, 0.5)
-        self.std = (1.0, 1.0, 1.0)
 
     def train_dataloader(self):
         transform = T.Compose(
@@ -20,7 +17,6 @@ class CIFAR10Data(pl.LightningDataModule):
                 T.RandomCrop(32, padding=4, padding_mode='reflect'),
                 T.RandomHorizontalFlip(),
                 T.ToTensor(),
-                T.Normalize(self.mean, self.std),
             ]
         )
         dataset = CIFAR10(root=self.hparams.data_dir, train=True, transform=transform, download=True)
@@ -38,7 +34,6 @@ class CIFAR10Data(pl.LightningDataModule):
         transform = T.Compose(
             [
                 T.ToTensor(),
-                T.Normalize(self.mean, self.std),
             ]
         )
         dataset = CIFAR10(root=self.hparams.data_dir, train=False, transform=transform, download=True)

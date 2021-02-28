@@ -19,6 +19,7 @@ from model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
 from model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
 from model.openai_enc_dec import Conv2d as PatchedConv2d
 from model.quantize import VQVAEQuantize, GumbelQuantize
+from model.loss import Normal, LogitLaplace
 
 # -----------------------------------------------------------------------------
 
@@ -34,7 +35,7 @@ class VQVAE(pl.LightningModule):
     ):
         super().__init__()
 
-        # init encoder/decoder module pair
+        # encoder/decoder module pair
         Encoder, Decoder = {
             'deepmind': (DeepMindEncoder, DeepMindDecoder),
             'openai': (OpenAIEncoder, OpenAIDecoder),
@@ -42,12 +43,20 @@ class VQVAE(pl.LightningModule):
         self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid)
         self.decoder = Decoder(n_init=embedding_dim, n_hid=n_hid, output_channels=input_channels)
 
-        # init the quantizer module
+        # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[args.vq_flavor]
         self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim)
+
+        # the data reconstruction loss in the ELBO
+        ReconLoss = {
+            'l2': Normal,
+            'logit_laplace': LogitLaplace,
+            # todo: add vqgan
+        }[args.loss_flavor]
+        self.recon_loss = ReconLoss
 
     def forward(self, x):
         z = self.encoder(x)
@@ -57,32 +66,26 @@ class VQVAE(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
+        x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
-        recon_loss = F.mse_loss(x_hat, x, reduction='mean')
+        recon_loss = self.recon_loss.nll(x, x_hat).mean()
         loss = recon_loss + latent_loss
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
+        x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
+        recon_loss = self.recon_loss.nll(x, x_hat).mean()
+        self.log('val_recon_loss', recon_loss, prog_bar=True)
 
-        # eval cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
+        # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
         encodings = F.one_hot(ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
         avg_probs = encodings.mean(0)
         perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
         cluster_use = torch.sum(avg_probs > 0)
         self.log('val_perplexity', perplexity, prog_bar=True)
         self.log('val_cluster_use', cluster_use, prog_bar=True)
-
-        """
-        data variance is fixed, estimated and used by deepmind in their cifar10 example presumably
-        to evaluate a proper log probability under a gaussian, except I think they are also
-        missing an additional factor of half? Leaving this alone and following their code anyway.
-        https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
-        """
-        data_variance = 0.06327039811675479
-        recon_error = F.mse_loss(x_hat, x, reduction='mean') / data_variance
-        self.log('val_recon_error', recon_error, prog_bar=True) # DeepMind converges to 0.056 in 4min 29s wallclock
 
     def configure_optimizers(self):
 
@@ -118,7 +121,7 @@ class VQVAE(pl.LightningModule):
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": 1e-5},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(optim_groups, lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
         self.optimizer = optimizer
 
         return optimizer
@@ -128,6 +131,7 @@ class VQVAE(pl.LightningModule):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument("--vq_flavor", type=str, default='vqvae', choices=['vqvae', 'gumbel'])
         parser.add_argument("--enc_dec_flavor", type=str, default='deepmind', choices=['deepmind', 'openai'])
+        parser.add_argument("--loss_flavor", type=str, default='l2', choices=['l2', 'logit_laplace'])
         return parser
 
 def cli_main():
@@ -152,7 +156,7 @@ def cli_main():
     model = VQVAE(args)
 
     # annealing schedules for lots of constants
-    checkpoint_callback = ModelCheckpoint(monitor='val_recon_error', mode='min')
+    checkpoint_callback = ModelCheckpoint(monitor='val_recon_loss', mode='min')
 
     def cos_anneal(e0, e1, t0, t1, e):
         """ ramp from (e0, t0) -> (e1, t1) through a cosine schedule based on e \in [e0, e1] """
