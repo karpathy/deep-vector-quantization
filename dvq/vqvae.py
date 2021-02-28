@@ -16,6 +16,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from data.cifar10 import CIFAR10Data
 from model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
+from model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
+from model.openai_enc_dec import Conv2d as PatchedConv2d
 from model.quantize import VQVAEQuantize, GumbelQuantize
 
 # -----------------------------------------------------------------------------
@@ -33,14 +35,28 @@ class VQVAE(pl.LightningModule):
     ):
         super().__init__()
 
-        self.encoder = DeepMindEncoder(in_channel, num_hiddens, num_residual_hiddens)
-        self.decoder = DeepMindDecoder(in_channel, num_hiddens, num_residual_hiddens, embedding_dim)
+        if args.enc_dec_flavor == 'deepmind':
+            self.encoder = DeepMindEncoder(in_channel, num_hiddens, num_residual_hiddens)
+            self.decoder = DeepMindDecoder(in_channel, num_hiddens, num_residual_hiddens, embedding_dim)
+            quantizer_input_channels = num_hiddens
+        elif args.enc_dec_flavor == 'openai':
+            # hacky, but openai modules have a different interpretation for where num_hiddens is measured (i.e. at base)
+            # we scale here so that we end up with roughly similar sizes of networks between the two flavors
+            num_hiddens = num_hiddens // 2
+            stride = 4
+            common = {'stride': stride, 'n_hid': num_hiddens, 'vocab_size': num_embeddings,
+                      'requires_grad': True, 'use_mixed_precision': False}
+            n_init = num_hiddens // 2
+            self.encoder = OpenAIEncoder(**common, input_channels=in_channel)
+            self.decoder = OpenAIDecoder(**common, output_channels=in_channel, n_init=n_init)
+            quantizer_input_channels = num_hiddens*2 if stride == 4 else num_hiddens*8
+            embedding_dim = n_init
 
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[args.vq_flavor]
-        self.quantizer = QuantizerModule(num_hiddens, embedding_dim, num_embeddings)
+        self.quantizer = QuantizerModule(quantizer_input_channels, embedding_dim, num_embeddings)
 
     def forward(self, x):
         z = self.encoder(x)
@@ -82,7 +98,7 @@ class VQVAE(pl.LightningModule):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ConvTranspose2d)
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ConvTranspose2d, PatchedConv2d)
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.BatchNorm2d, torch.nn.Embedding)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
@@ -120,6 +136,7 @@ class VQVAE(pl.LightningModule):
     def add_model_specific_args(parent_parser):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument("--vq_flavor", type=str, default='vqvae', choices=['vqvae', 'gumbel'])
+        parser.add_argument("--enc_dec_flavor", type=str, default='deepmind', choices=['deepmind', 'openai'])
         return parser
 
 def cli_main():
@@ -168,7 +185,7 @@ def cli_main():
 
     class DecayLR(pl.Callback):
         def on_train_epoch_start(self, trainer, pl_module):
-            t = cos_anneal(0, 100, 3e-4, 1e-5, trainer.current_epoch)
+            t = cos_anneal(0, 190, 3e-4, 1e-5, trainer.current_epoch)
             print("epoch %d: setting learning rate to %e" % (trainer.current_epoch, t))
             for g in pl_module.optimizer.param_groups:
                 g['lr'] = t
