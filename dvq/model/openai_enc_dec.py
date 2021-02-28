@@ -20,20 +20,6 @@ import torch.nn.functional as F
 
 # -----------------------------------------------------------------------------
 
-logit_laplace_eps: float = 0.1
-
-def map_pixels(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype != torch.float:
-        raise ValueError('expected input to have type float')
-    return (1 - 2 * logit_laplace_eps) * x + logit_laplace_eps
-
-
-def unmap_pixels(x: torch.Tensor) -> torch.Tensor:
-    if x.dtype != torch.float:
-        raise ValueError('expected input to have type float')
-    return torch.clamp((x - logit_laplace_eps) / (1 - 2 * logit_laplace_eps), 0, 1)
-
-
 @attr.s(eq=False)
 class Conv2d(nn.Module):
     n_in:  int = attr.ib(validator=lambda i, a, x: x >= 1)
