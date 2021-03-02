@@ -25,30 +25,24 @@ from model.loss import Normal, LogitLaplace
 
 class VQVAE(pl.LightningModule):
 
-    def __init__(
-        self,
-        args,
-        input_channels=3,   # number of channels at the input (for images typically 3 = RGB)
-        n_hid=64,           # controls the size of the model
-        embedding_dim=32,   # the embedding size for each vocabulary element
-        num_embeddings=512, # size of the vocabulary at the middle
-    ):
+    def __init__(self, args, input_channels=3):
         super().__init__()
+        self.args = args
 
         # encoder/decoder module pair
         Encoder, Decoder = {
             'deepmind': (DeepMindEncoder, DeepMindDecoder),
             'openai': (OpenAIEncoder, OpenAIDecoder),
         }[args.enc_dec_flavor]
-        self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid)
-        self.decoder = Decoder(n_init=embedding_dim, n_hid=n_hid, output_channels=input_channels)
+        self.encoder = Encoder(input_channels=input_channels, n_hid=args.n_hid)
+        self.decoder = Decoder(n_init=args.embedding_dim, n_hid=args.n_hid, output_channels=input_channels)
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[args.vq_flavor]
-        self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim)
+        self.quantizer = QuantizerModule(self.encoder.output_channels, args.num_embeddings, args.embedding_dim)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -68,7 +62,7 @@ class VQVAE(pl.LightningModule):
         x, y = batch # hate that i have to do this here in the model
         x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
-        recon_loss = self.recon_loss.nll(x, x_hat).mean()
+        recon_loss = self.recon_loss.nll(x, x_hat)
         loss = recon_loss + latent_loss
         return loss
 
@@ -76,7 +70,7 @@ class VQVAE(pl.LightningModule):
         x, y = batch # hate that i have to do this here in the model
         x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
-        recon_loss = self.recon_loss.nll(x, x_hat).mean()
+        recon_loss = self.recon_loss.nll(x, x_hat)
         self.log('val_recon_loss', recon_loss, prog_bar=True)
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
@@ -118,7 +112,7 @@ class VQVAE(pl.LightningModule):
 
         # create the pytorch optimizer object
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": 1e-5},
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": 1e-4},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=3e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
@@ -129,10 +123,48 @@ class VQVAE(pl.LightningModule):
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
+        # model type
         parser.add_argument("--vq_flavor", type=str, default='vqvae', choices=['vqvae', 'gumbel'])
         parser.add_argument("--enc_dec_flavor", type=str, default='deepmind', choices=['deepmind', 'openai'])
         parser.add_argument("--loss_flavor", type=str, default='l2', choices=['l2', 'logit_laplace'])
+        # model size
+        parser.add_argument("--num_embeddings", type=int, default=512, help="vocabulary size; number of possible discrete states")
+        parser.add_argument("--embedding_dim", type=int, default=64, help="size of the vector of the embedding of each discrete token")
+        parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
         return parser
+
+# -----------------------------------------------------------------------------
+def cos_anneal(e0, e1, t0, t1, e):
+    """ ramp from (e0, t0) -> (e1, t1) through a cosine schedule based on e \in [e0, e1] """
+    alpha = max(0, min(1, (e - e0) / (e1 - e0))) # what fraction of the way through are we
+    alpha = 1.0 - math.cos(alpha * math.pi/2) # warp through cosine
+    t = alpha * t1 + (1 - alpha) * t0 # interpolate accordingly
+    return t
+
+"""
+These ramps/decays follow DALL-E Appendix A.2 Training https://arxiv.org/abs/2102.12092
+"""
+class DecayTemperature(pl.Callback):
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
+        # The relaxation temperature τ is annealed from 1 to 1/16 over the first 150,000 updates.
+        t = cos_anneal(0, 150000, 1.0, 1.0/16, trainer.global_step)
+        pl_module.quantizer.temperature = t
+
+class RampBeta(pl.Callback):
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
+        # The KL weight β is increased from 0 to 6.6 over the first 5000 updates
+        # "We divide the overall loss by 256 × 256 × 3, so that the weight of the KL term
+        # becomes β/192, where β is the KL weight."
+        # TODO: OpenAI uses 6.6/192 but kinda tricky to do the conversion here... about 5e-4 works for this repo so far... :\
+        t = cos_anneal(0, 5000, 0.0, 5e-4, trainer.global_step)
+        pl_module.quantizer.kld_scale = t
+
+class DecayLR(pl.Callback):
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
+        # The step size is annealed from 1e10−4 to 1.25e10−6 over 1,200,000 updates. I use 3e-4
+        t = cos_anneal(0, 1200000, 3e-4, 1.25e-6, trainer.global_step)
+        for g in pl_module.optimizer.param_groups:
+            g['lr'] = t
 
 def cli_main():
     pl.seed_everything(1337)
@@ -156,39 +188,12 @@ def cli_main():
     model = VQVAE(args)
 
     # annealing schedules for lots of constants
-    checkpoint_callback = ModelCheckpoint(monitor='val_recon_loss', mode='min')
-
-    def cos_anneal(e0, e1, t0, t1, e):
-        """ ramp from (e0, t0) -> (e1, t1) through a cosine schedule based on e \in [e0, e1] """
-        alpha = max(0, min(1, (e - e0) / (e1 - e0))) # what fraction of the way through are we
-        alpha = 1.0 - math.cos(alpha * math.pi/2) # warp through cosine
-        t = alpha * t1 + (1 - alpha) * t0 # interpolate accordingly
-        return t
-
-    # these follow the OpenAI DALL-E paper recommendations *very roughly*
-    class DecayTemperature(pl.Callback):
-        def on_train_epoch_start(self, trainer, pl_module):
-            t = cos_anneal(0, 50, 1.0, 1.0/16, trainer.current_epoch)
-            print("epoch %d: setting temperature of model's quantizer to %f" % (trainer.current_epoch, t))
-            pl_module.quantizer.temperature = t
-
-    class RampBeta(pl.Callback):
-        def on_train_epoch_start(self, trainer, pl_module):
-            t = cos_anneal(0, 20, 0.0, 5e-4, trainer.current_epoch)
-            print("epoch %d: setting kld scale to %e" % (trainer.current_epoch, t))
-            pl_module.quantizer.kld_scale = t
-
-    class DecayLR(pl.Callback):
-        def on_train_epoch_start(self, trainer, pl_module):
-            t = cos_anneal(0, 190, 3e-4, 1e-5, trainer.current_epoch)
-            print("epoch %d: setting learning rate to %e" % (trainer.current_epoch, t))
-            for g in pl_module.optimizer.param_groups:
-                g['lr'] = t
-
-    callbacks = [checkpoint_callback, DecayLR()]
+    callbacks = []
+    callbacks.append(ModelCheckpoint(monitor='val_recon_loss', mode='min'))
+    callbacks.append(DecayLR())
     if args.vq_flavor == 'gumbel':
-        callbacks.extend([DecayTemperature(), RampBeta()])
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_epochs=200)
+       callbacks.extend([DecayTemperature(), RampBeta()])
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=3000000)
 
     trainer.fit(model, data)
 

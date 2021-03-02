@@ -45,4 +45,4 @@ class Normal:
 
     @classmethod
     def nll(cls, x, mu):
-        return (x - mu)**2 / (2 * cls.data_variance) #+ math.log(math.sqrt(2 * math.pi * cls.data_variance))
+        return ((x - mu)**2).mean() / (2 * cls.data_variance) #+ math.log(math.sqrt(2 * math.pi * cls.data_variance))
