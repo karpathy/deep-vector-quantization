@@ -14,12 +14,12 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from data.cifar10 import CIFAR10Data
-from model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
-from model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
-from model.openai_enc_dec import Conv2d as PatchedConv2d
-from model.quantize import VQVAEQuantize, GumbelQuantize
-from model.loss import Normal, LogitLaplace
+from dvq.data.cifar10 import CIFAR10Data
+from dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
+from dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
+from dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
+from dvq.model.quantize import VQVAEQuantize, GumbelQuantize
+from dvq.model.loss import Normal, LogitLaplace
 
 # -----------------------------------------------------------------------------
 
@@ -60,7 +60,6 @@ class VQVAE(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
-        x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         loss = recon_loss + latent_loss
@@ -68,7 +67,6 @@ class VQVAE(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
-        x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         self.log('val_recon_loss', recon_loss, prog_bar=True)
