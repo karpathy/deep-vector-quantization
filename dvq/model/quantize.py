@@ -32,6 +32,7 @@ class VQVAEQuantize(nn.Module):
         self.kld_scale = 10.0
 
         self.output_proj = embedding_dim
+        self.patch_width = patch_width
 
         if 'SINGLE_TOKEN' in os.environ:
             self.proj = nn.Linear(embedding_dim, embedding_dim)  # Perhaps could be removed
@@ -54,7 +55,7 @@ class VQVAEQuantize(nn.Module):
         else:
             B, C, H, W = z.size()
             z_e = self.proj(z)  #  (B, E, H, W)  # Output proj channels = E
-            z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64
+            z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64 or 128, 8, 8, 4096
             if 'SINGLE_TOKEN2' in os.environ:
                 # Enlarge token size (embedding_dim) so that we get one image per token,
                 # instead of a grid of image patch tokens
@@ -67,8 +68,9 @@ class VQVAEQuantize(nn.Module):
         # Works just as well with one point per cluster in single token regime which is somewhat sus.
         if self.training and self.data_initialized.item() == 0:
             # TODO: Build up a larger batch (at least greater than self.n_embed) orig had 64B = n_embd
-            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * 64) * 100)}%')
-            if self.data_init_points < self.n_embed * 64:  # Let's ensure 64 points per cluster like Karpathy originally had
+            kmeans_batch_mult = 64  # 64
+            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_batch_mult) * 100)}%')
+            if self.data_init_points < self.n_embed * kmeans_batch_mult:  # Let's ensure 64 points per cluster like Karpathy originally had
                 self.data_init_buffer.append(flatten)
                 self.data_init_points += flatten.size(0)
             else:

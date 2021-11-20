@@ -64,7 +64,7 @@ class VQVAE(pl.LightningModule):
     def forward(self, x):
         z = self.encoder(x)
         z_q, latent_loss, ind = self.quantizer(z)  # zq 128, 64, 8, 8 vs 128, 1024
-        if self.training or 'SINGLE_TOKEN2' not in os.environ:
+        if True or self.training or 'SINGLE_TOKEN2' not in os.environ:
             x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
         else:
             x_hat = self.decoder(z)
