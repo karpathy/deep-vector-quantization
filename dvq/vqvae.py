@@ -14,12 +14,13 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from data.cifar10 import CIFAR10Data
-from model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
-from model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
-from model.openai_enc_dec import Conv2d as PatchedConv2d
-from model.quantize import VQVAEQuantize, GumbelQuantize
-from model.loss import Normal, LogitLaplace
+from dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS
+from dvq.data.cifar10 import CIFAR10Data
+from dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
+from dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
+from dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
+from dvq.model.quantize import VQVAEQuantize, GumbelQuantize
+from dvq.model.loss import Normal, LogitLaplace
 
 # -----------------------------------------------------------------------------
 
@@ -34,15 +35,23 @@ class VQVAE(pl.LightningModule):
             'deepmind': (DeepMindEncoder, DeepMindDecoder),
             'openai': (OpenAIEncoder, OpenAIDecoder),
         }[args.enc_dec_flavor]
-        self.encoder = Encoder(input_channels=input_channels, n_hid=args.n_hid)
-        self.decoder = Decoder(n_init=args.embedding_dim, n_hid=args.n_hid, output_channels=input_channels)
+        self.encoder = Encoder(input_channels=input_channels, n_hid=args.n_hid, input_width=32, embedding_dim=args.embedding_dim)
+
+        if 'SINGLE_TOKEN2' in os.environ:
+            decoder_init = args.embedding_dim // self.encoder.out_width ** 2
+        else:
+            decoder_init = args.embedding_dim
+
+        self.decoder = Decoder(encoder=self.encoder, n_init=decoder_init, n_hid=args.n_hid,
+                               output_channels=input_channels, embedding_dim=args.embedding_dim)
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[args.vq_flavor]
-        self.quantizer = QuantizerModule(self.encoder.output_channels, args.num_embeddings, args.embedding_dim)
+        self.quantizer = QuantizerModule(self.encoder.output_channels, args.num_embeddings, args.embedding_dim,
+                                         patch_width=self.encoder.out_width)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -54,13 +63,15 @@ class VQVAE(pl.LightningModule):
 
     def forward(self, x):
         z = self.encoder(x)
-        z_q, latent_loss, ind = self.quantizer(z)
-        x_hat = self.decoder(z_q)
+        z_q, latent_loss, ind = self.quantizer(z)  # zq 128, 64, 8, 8 vs 128, 1024
+        if True or self.training or 'SINGLE_TOKEN2' not in os.environ:
+            x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
+        else:
+            x_hat = self.decoder(z)
         return x_hat, latent_loss, ind
 
     def training_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
-        x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         loss = recon_loss + latent_loss
@@ -68,18 +79,19 @@ class VQVAE(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
-        x = self.recon_loss.inmap(x)
         x_hat, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
-        self.log('val_recon_loss', recon_loss, prog_bar=True)
+        self.log('dvq_val_recon_loss', recon_loss, prog_bar=True)
+        self.log('dvq_latent_loss', latent_loss, prog_bar=True)
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
         encodings = F.one_hot(ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
         avg_probs = encodings.mean(0)
+        print(avg_probs)
         perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
         cluster_use = torch.sum(avg_probs > 0)
-        self.log('val_perplexity', perplexity, prog_bar=True)
-        self.log('val_cluster_use', cluster_use, prog_bar=True)
+        self.log('dvq_val_perplexity', perplexity, prog_bar=True)
+        self.log('dvq_val_cluster_use', cluster_use, prog_bar=True)
 
     def configure_optimizers(self):
 
@@ -128,8 +140,18 @@ class VQVAE(pl.LightningModule):
         parser.add_argument("--enc_dec_flavor", type=str, default='deepmind', choices=['deepmind', 'openai'])
         parser.add_argument("--loss_flavor", type=str, default='l2', choices=['l2', 'logit_laplace'])
         # model size
-        parser.add_argument("--num_embeddings", type=int, default=512, help="vocabulary size; number of possible discrete states")
-        parser.add_argument("--embedding_dim", type=int, default=64, help="size of the vector of the embedding of each discrete token")
+        if 'SINGLE_TOKEN' in os.environ:
+            default_embedding_dim = 1024
+            default_num_embeddings = 8192
+        elif 'SINGLE_TOKEN2' in os.environ:
+            default_embedding_dim = 4096
+            default_num_embeddings = SINGLE_TOKEN2_NUM_EMBEDDINGS
+        else:
+            default_embedding_dim = 64
+            default_num_embeddings = 512
+
+        parser.add_argument("--num_embeddings", type=int, default=default_num_embeddings, help="vocabulary size; number of possible discrete states")
+        parser.add_argument("--embedding_dim", type=int, default=default_embedding_dim, help="size of the vector of the embedding of each discrete token")
         parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
         return parser
 
@@ -179,7 +201,7 @@ def cli_main():
     # dataloader related
     parser.add_argument("--data_dir", type=str, default='/apcv/users/akarpathy/cifar10')
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=0)
     # done!
     args = parser.parse_args()
     # -------------------------------------------------------------------------
@@ -189,7 +211,7 @@ def cli_main():
 
     # annealing schedules for lots of constants
     callbacks = []
-    callbacks.append(ModelCheckpoint(monitor='val_recon_loss', mode='min'))
+    callbacks.append(ModelCheckpoint(monitor='dvq_val_recon_loss', mode='min', save_top_k=3))
     callbacks.append(DecayLR())
     if args.vq_flavor == 'gumbel':
        callbacks.extend([DecayTemperature(), RampBeta()])
